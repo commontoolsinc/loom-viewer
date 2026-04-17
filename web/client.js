@@ -1,6 +1,7 @@
 // loom-viewer client — canvas renderer + SSE state + interactions.
-// Tapestry is the hero: ~70% of canvas, glowing with everything taken care of.
-// Machinery is the supporting cast: a thin, dim top strip.
+// Tapestry is the hero: glowing with everything taken care of. Machinery is
+// supporting cast. Every moving pixel is backed by real work — per-thread
+// breathing, thickness, and weave all derive from wish substance.
 
 const TARGET_COLORS = {
   capture: [40, 45, 64], // warm yellow [hue, sat, lightness]
@@ -14,29 +15,46 @@ const TARGET_COLORS = {
 const MACHINERY_RATIO = 0.14; // top strip
 const HEADER_PAD = 52; // room for HUD text
 const FOOTER_PAD = 52; // room for micro-summary
-const THREAD_PITCH = 6; // vertical space per tapestry thread (px)
-const THREAD_HEIGHT = 1.6; // drawn thickness
-const ARRIVAL_DURATION = 1600; // ms a warm pulse animation runs
+const THREAD_PITCH = 7; // vertical space per tapestry thread (px)
+const FELL_HEIGHT = 10; // heated band where the cloth is being woven
+const ARRIVAL_DURATION = 1600;
 const SPARKLE_COUNT = 5;
 
+// Per-thread breathing. Amplitude scales with wish energy; hash-seeded
+// clock means every thread has its own rhythm. Never synchronized.
+const BREATH_PERIOD_MIN = 6000; // ms
+const BREATH_PERIOD_MAX = 18000;
+const BREATH_AMP_BASE = 0.04;
+const BREATH_AMP_ENERGY = 0.12;
+
+// Memory pulses: every 4-9s, one old heavy thread gets a shuttle re-pass —
+// a bright segment travelling left-to-right as if the loom is remembering.
+const PULSE_INTERVAL_MIN = 4000;
+const PULSE_INTERVAL_MAX = 9000;
+const PULSE_DURATION = 2400;
+const PULSE_MAX_CONCURRENT = 2;
+
+// Token motes: rare upward particles rising off heavy threads.
+const MOTE_POOL_MAX = 36;
+const MOTE_LIFE_MIN = 3000;
+const MOTE_LIFE_MAX = 5200;
+
 // ---- State ----
-let state = null; // current FabricState from the server
-let prevState = null; // the previous snapshot (for arrival-moment detection)
+let state = null;
+let prevState = null;
 let connected = false;
 
 // Sorted lists derived once per snapshot
 let sortedDone = [];
-let activeRoles = []; // union of active + lastSeen roles, alphabetized
+let activeRoles = [];
 let roleIndex = new Map();
+let substanceCache = new Map(); // wishId -> { thickness, energy, crossings, weaveSeeds, period }
 
 // ---- Animation state ----
-const arrivals = []; // { wishId, t0, y, color }
-const dustMotes = Array.from({ length: 14 }, () => ({
-  x: Math.random(),
-  y: Math.random(),
-  phase: Math.random() * Math.PI * 2,
-  speed: 0.02 + Math.random() * 0.04,
-}));
+const arrivals = []; // { wishId, t0, color }
+const memoryPulses = []; // { wishId, t0 }
+const tokenMotes = []; // { x, y, vy, life, born, hue, sat }
+let nextPulseAt = performance.now() + randRange(PULSE_INTERVAL_MIN, PULSE_INTERVAL_MAX);
 
 // ---- Canvas ----
 const canvas = document.getElementById("loom");
@@ -97,6 +115,13 @@ function deriveSorted() {
   });
   activeRoles = [...roleSet].sort();
   roleIndex = new Map(activeRoles.map((r, i) => [r, i]));
+
+  // Precompute per-wish substance (pure function, cheap, ~100 threads).
+  const nextCache = new Map();
+  for (const w of sortedDone) {
+    nextCache.set(w.id, computeSubstance(w, state.postmortems?.[w.id]));
+  }
+  substanceCache = nextCache;
 }
 
 function detectArrivals() {
@@ -119,7 +144,44 @@ function fireArrival(wish) {
   enqueueWhisper(wish);
 }
 
-// ---- Color helpers ----
+// ---- Substance (what each thread is "made of") ----
+function computeSubstance(w, pm) {
+  const h0 = hash(w.id);
+  const logSteps = w.log ? w.log.split(" | ").filter(Boolean).length : 1;
+  const tokens = pm?.totalTokens ?? 0;
+  const quality = pm?.qualityScore ?? 3;
+
+  // Effort proxy: log steps (always present) + tokens (when available).
+  const effortBase = Math.log2(1 + logSteps) / Math.log2(11); // ~0..1 at 10 steps
+  const tokenBonus = tokens > 0 ? clamp(Math.log2(tokens / 50_000) / Math.log2(32), 0, 1) : 0;
+  const effort = clamp(0.55 * effortBase + 0.45 * tokenBonus, 0, 1);
+
+  // Energy = effort + quality contribution. Used for breathing amplitude
+  // and mote spawn probability. A stub = 0.1, a big quality-5 wish ≈ 1.
+  const energy = clamp(effort * 0.7 + (quality / 5) * 0.3, 0, 1);
+
+  // Thread thickness: 1.0..3.2 px.
+  const thickness = 1.0 + effort * 2.2;
+
+  // Weave density: micro-crossings along the thread.
+  const crossings = clamp(Math.round(1.5 * logSteps), 3, 13);
+
+  // Stable-seeded x-offsets (0..1) for each crossing, so the weave pattern
+  // never jumps between frames or reorders.
+  const weaveSeeds = new Array(crossings);
+  for (let i = 0; i < crossings; i++) {
+    weaveSeeds[i] = ((h0 * (i + 7) * 2654435761) >>> 0) / 4294967296;
+  }
+
+  // Per-thread breathing period (hash-seeded, never synchronized).
+  const period = BREATH_PERIOD_MIN +
+    (h0 % 1000) / 1000 * (BREATH_PERIOD_MAX - BREATH_PERIOD_MIN);
+  const breathPhase = ((h0 >> 10) % 1000) / 1000 * Math.PI * 2;
+
+  return { thickness, energy, crossings, weaveSeeds, period, breathPhase, h0 };
+}
+
+// ---- Color / math helpers ----
 function colorForTarget(target) {
   return TARGET_COLORS[target] ?? TARGET_COLORS.other;
 }
@@ -141,29 +203,29 @@ function ageDays(iso) {
 }
 
 function ageAlpha(days) {
-  // Today glows strongly. Yesterday solid. Older gently recedes. Min 0.24.
   if (days < 0.08) return 1.0;
-  return Math.max(0.24, 1 - Math.log2(1 + days) * 0.18);
+  return Math.max(0.28, 1 - Math.log2(1 + days) * 0.16);
 }
 
-// Extra additive "glow" for very recent threads — makes today pop.
-function freshGlow(days) {
-  if (days < 0.04) return 0.45; // ~1hr
-  if (days < 0.2) return 0.25; // ~5hr
-  if (days < 0.5) return 0.12; // ~12hr
-  return 0;
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+function randRange(a, b) {
+  return a + Math.random() * (b - a);
 }
 
 // ---- Layout ----
 function layout() {
   const headerH = HEADER_PAD;
   const machineryH = Math.floor((H - headerH - FOOTER_PAD) * MACHINERY_RATIO);
-  const tapestryY = headerH + machineryH + 2; // sits right under the reed line
+  const fellY = headerH + machineryH;
+  const tapestryY = fellY + FELL_HEIGHT;
   const tapestryH = H - tapestryY - FOOTER_PAD;
   return {
     headerH,
     machineryY: headerH,
     machineryH,
+    fellY,
     tapestryY,
     tapestryH,
     tapestryLeft: 64,
@@ -171,57 +233,50 @@ function layout() {
   };
 }
 
-// ---- Render ----
+// ---- Render loop ----
+let lastFrame = performance.now();
 function draw(now) {
+  const dt = Math.min(50, now - lastFrame);
+  lastFrame = now;
   ctx.clearRect(0, 0, W, H);
   const L = layout();
 
-  drawDustMotes(L, now);
+  updateMemoryPulses(now);
+  updateTokenMotes(now, dt, L);
+
   drawMachinery(L, now);
+  drawFellBand(L, now);
   drawTapestry(L, now);
+  drawTokenMotes(L);
   drawArrivals(L, now);
 
   requestAnimationFrame(draw);
 }
 
-function drawDustMotes(L, now) {
-  ctx.save();
-  for (const m of dustMotes) {
-    const t = now / 1000;
-    const x = (m.x + Math.sin(t * m.speed + m.phase) * 0.08) * W;
-    const y = (m.y + Math.cos(t * m.speed * 0.7 + m.phase) * 0.08) * H;
-    const alpha = 0.08 + Math.sin(t * 0.5 + m.phase) * 0.04;
-    ctx.fillStyle = `rgba(246, 200, 122, ${Math.max(0.02, alpha)})`;
-    ctx.beginPath();
-    ctx.arc(x, y, 1.1, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.restore();
-}
-
+// ---- Machinery strip ----
 function drawMachinery(L, now) {
   if (!state) return;
   const t = now / 1000;
   const machineryBottom = L.machineryY + L.machineryH;
   const warpLeft = L.tapestryLeft;
-  const warpRight = L.tapestryRight - 80; // leave room for "hank" on the right
+  const warpRight = L.tapestryRight - 80;
   const n = Math.max(1, activeRoles.length);
 
-  // Warps
   ctx.save();
   for (let i = 0; i < n; i++) {
     const x = warpLeft + (warpRight - warpLeft) * ((i + 0.5) / n);
     const breathe = 0.30 + Math.sin(t * 0.8 + i) * 0.06;
-    ctx.strokeStyle = `hsla(30, 22%, 55%, ${breathe})`;
+    // Warps descend from top of strip THROUGH the fell band INTO the cloth.
+    const grad = ctx.createLinearGradient(0, L.machineryY, 0, L.tapestryY + 16);
+    grad.addColorStop(0, `hsla(30, 22%, 55%, ${breathe})`);
+    grad.addColorStop(0.85, `hsla(30, 30%, 62%, ${breathe + 0.1})`);
+    grad.addColorStop(1, `hsla(30, 22%, 55%, 0)`);
+    ctx.strokeStyle = grad;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x, L.machineryY + 4);
-    ctx.lineTo(x, machineryBottom - 4);
+    ctx.lineTo(x, L.tapestryY + 14);
     ctx.stroke();
-
-    // tiny label dot at top (only text on hover — see HUD handling)
-    ctx.fillStyle = "hsla(30, 22%, 70%, 0.25)";
-    ctx.fillRect(x - 2, L.machineryY + 2, 4, 2);
   }
 
   // Hank of pending wishes on the right
@@ -246,7 +301,6 @@ function drawMachinery(L, now) {
     const yMid = L.machineryY + L.machineryH * 0.55;
     const yOsc = Math.sin(t * 1.4 + idx) * (L.machineryH * 0.25);
     const cy = yMid + yOsc;
-    // soft glow
     const grd = ctx.createRadialGradient(x, cy, 0, x, cy, 14);
     grd.addColorStop(0, "hsla(40, 80%, 72%, 0.55)");
     grd.addColorStop(1, "hsla(40, 80%, 72%, 0)");
@@ -254,14 +308,13 @@ function drawMachinery(L, now) {
     ctx.beginPath();
     ctx.arc(x, cy, 14, 0, Math.PI * 2);
     ctx.fill();
-    // core lozenge
     ctx.fillStyle = "hsla(40, 85%, 80%, 0.95)";
     ctx.beginPath();
     ctx.ellipse(x, cy, 5, 3.2, 0, 0, Math.PI * 2);
     ctx.fill();
   });
 
-  // Beacons: needs_human wishes appear as amber pulsing circles on the machinery strip
+  // Beacons: needs_human wishes
   const beacons = state.wishes.filter((w) => w.status === "needs_human" || w.status === "blocked");
   beacons.forEach((w, i) => {
     const x = warpLeft + 30 + (i * 28);
@@ -272,51 +325,202 @@ function drawMachinery(L, now) {
     ctx.arc(x, cy, 4, 0, Math.PI * 2);
     ctx.fill();
   });
-
   ctx.restore();
 }
 
-function drawTapestry(L, now) {
-  if (!state) return;
+// ---- Fell band: the warm heated line where the loom is working now ----
+function drawFellBand(L, now) {
   const t = now / 1000;
+  const y = L.fellY;
+  const flicker = 0.85 + Math.sin(t * 1.7) * 0.06 + Math.sin(t * 3.3) * 0.04;
+  const bandAlpha = 0.22 * flicker;
+
+  // Heat gradient: vertical, hot at bottom of the band (where cloth meets loom)
+  const grad = ctx.createLinearGradient(0, y, 0, y + FELL_HEIGHT + 4);
+  grad.addColorStop(0, `hsla(35, 70%, 62%, 0)`);
+  grad.addColorStop(0.5, `hsla(35, 75%, 65%, ${bandAlpha * 0.8})`);
+  grad.addColorStop(1, `hsla(30, 60%, 58%, ${bandAlpha * 1.3})`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(L.tapestryLeft - 12, y, (L.tapestryRight - L.tapestryLeft) + 24, FELL_HEIGHT + 4);
+
+  // Embers — small bright points drifting along the fell line
+  for (let i = 0; i < 6; i++) {
+    const x = L.tapestryLeft +
+      (L.tapestryRight - L.tapestryLeft) * (((t * 0.05) + i * 0.17) % 1);
+    const ey = y + FELL_HEIGHT - 2 + Math.sin(t * 2 + i) * 1.5;
+    const a = 0.3 + Math.sin(t * 2.4 + i * 1.3) * 0.25;
+    ctx.fillStyle = `hsla(40, 85%, 78%, ${Math.max(0, a)})`;
+    ctx.beginPath();
+    ctx.arc(x, ey, 1.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ---- Memory pulses: old heavy threads re-illumine as if the loom remembers ----
+function updateMemoryPulses(now) {
+  // Retire expired
+  for (let i = memoryPulses.length - 1; i >= 0; i--) {
+    if (now - memoryPulses[i].t0 > PULSE_DURATION) memoryPulses.splice(i, 1);
+  }
+  // Spawn
+  if (now >= nextPulseAt && memoryPulses.length < PULSE_MAX_CONCURRENT) {
+    spawnMemoryPulse();
+    nextPulseAt = now + randRange(PULSE_INTERVAL_MIN, PULSE_INTERVAL_MAX);
+  }
+}
+
+function spawnMemoryPulse() {
+  if (sortedDone.length < 4) return;
+  // Weight: prefer older AND heavier threads — inverse of "today's glow"
+  const candidates = sortedDone.slice(2); // skip the freshest few
+  let totalW = 0;
+  const weights = candidates.map((w) => {
+    const sub = substanceCache.get(w.id);
+    if (!sub) return 0;
+    const days = ageDays(w.statusSince);
+    const oldness = clamp(Math.log2(1 + days) / 4, 0, 1); // 0..1 as days grow
+    const weight = sub.energy * (0.35 + oldness * 0.65);
+    totalW += weight;
+    return weight;
+  });
+  if (totalW <= 0) return;
+  let r = Math.random() * totalW;
+  let pickedIdx = -1;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) {
+      pickedIdx = i;
+      break;
+    }
+  }
+  if (pickedIdx < 0) pickedIdx = 0;
+  const w = candidates[pickedIdx];
+  memoryPulses.push({ wishId: w.id, t0: performance.now() });
+}
+
+function drawMemoryPulse(L, now, pulse, threadIdx) {
+  const dt = now - pulse.t0;
+  if (dt < 0 || dt > PULSE_DURATION) return;
+  const p = dt / PULSE_DURATION;
+  const y = L.tapestryY + threadIdx * THREAD_PITCH;
   const left = L.tapestryLeft;
   const right = L.tapestryRight;
   const width = right - left;
+  const sub = substanceCache.get(pulse.wishId);
+  if (!sub) return;
+
+  const head = left + width * p;
+  const tail = Math.max(left, head - width * 0.22);
+  const w = state?.wishes.find((x) => x.id === pulse.wishId);
+  const [hue, sat] = w ? colorForTarget(w.target) : [40, 60];
+
+  const grad = ctx.createLinearGradient(tail, 0, head, 0);
+  const envelope = Math.sin(p * Math.PI); // rise and fall
+  grad.addColorStop(0, `hsla(${hue}, ${sat + 20}%, 72%, 0)`);
+  grad.addColorStop(1, `hsla(${hue}, ${sat + 20}%, 78%, ${0.55 * envelope})`);
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = sub.thickness + 1.5;
+  ctx.beginPath();
+  ctx.moveTo(tail, y);
+  ctx.lineTo(head, y);
+  ctx.stroke();
+}
+
+// ---- Token motes: rare upward drift off heavy threads ----
+function updateTokenMotes(now, dt, L) {
+  // Age + rise
+  for (let i = tokenMotes.length - 1; i >= 0; i--) {
+    const m = tokenMotes[i];
+    if (now - m.born > m.life) {
+      tokenMotes.splice(i, 1);
+      continue;
+    }
+    m.y += m.vy * (dt / 1000);
+    m.x += Math.sin((now - m.born) / 600 + m.seed) * 0.15;
+  }
+  // Spawn: iterate only top-visible threads, low prob per frame
+  if (tokenMotes.length >= MOTE_POOL_MAX || sortedDone.length === 0) return;
+  const maxThreads = Math.min(sortedDone.length, Math.floor(L.tapestryH / THREAD_PITCH));
+  // Pick one random visible thread per frame with its own spawn probability.
+  const idx = Math.floor(Math.random() * maxThreads);
+  const w = sortedDone[idx];
+  const sub = substanceCache.get(w.id);
+  if (!sub) return;
+  // Fresher threads spawn more, but old heavy threads still occasionally emit.
+  const age = ageDays(w.statusSince);
+  const freshness = age < 1 ? 1 : age < 7 ? 0.4 : 0.15;
+  const p = sub.energy * freshness * 0.12; // per-frame probability for this thread
+  if (Math.random() < p) {
+    const [hue, sat] = colorForTarget(w.target);
+    const y = L.tapestryY + idx * THREAD_PITCH;
+    const x = L.tapestryLeft + 20 + Math.random() * (L.tapestryRight - L.tapestryLeft - 40);
+    tokenMotes.push({
+      x,
+      y,
+      vy: -(4 + Math.random() * 6), // px/s upward
+      life: MOTE_LIFE_MIN + Math.random() * (MOTE_LIFE_MAX - MOTE_LIFE_MIN),
+      born: now,
+      hue,
+      sat,
+      seed: Math.random() * 100,
+    });
+  }
+}
+
+function drawTokenMotes(L) {
+  const now = performance.now();
+  ctx.save();
+  for (const m of tokenMotes) {
+    const t = (now - m.born) / m.life;
+    if (t < 0 || t > 1) continue;
+    const alpha = Math.pow(1 - t, 1.6) * 0.45;
+    ctx.fillStyle = `hsla(${m.hue}, ${m.sat + 20}%, 80%, ${alpha})`;
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, 1.1, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ---- Tapestry (hero) ----
+function drawTapestry(L, now) {
+  if (!state) return;
+  const left = L.tapestryLeft;
+  const right = L.tapestryRight;
   const maxThreads = Math.floor(L.tapestryH / THREAD_PITCH);
   const threads = sortedDone.slice(0, maxThreads);
 
-  // Reed line at the top edge — visually connects machinery to cloth.
-  ctx.strokeStyle = "hsla(30, 35%, 55%, 0.25)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(left - 12, L.tapestryY - 1);
-  ctx.lineTo(right + 12, L.tapestryY - 1);
-  ctx.stroke();
-
   ctx.save();
-  // Clip tapestry to its bounds so the edge fade works cleanly.
+  // Clip so edge fades are clean.
   ctx.beginPath();
   ctx.rect(left - 4, L.tapestryY - 2, (right - left) + 8, L.tapestryH + 2);
   ctx.clip();
 
+  // Build a wish-id → thread-index map for memory pulses
+  const indexById = new Map(threads.map((w, i) => [w.id, i]));
+
   for (let i = 0; i < threads.length; i++) {
     const w = threads[i];
-    const h0 = hash(w.id);
-    const jitter = ((h0 % 100) / 100 - 0.5) * 1.4; // ±0.7px
+    const sub = substanceCache.get(w.id);
+    if (!sub) continue;
+    const jitter = ((sub.h0 % 100) / 100 - 0.5) * 1.2;
     const y = L.tapestryY + i * THREAD_PITCH + jitter;
     const [hue, sat, base] = colorForTarget(w.target);
     const age = ageDays(w.statusSince ?? w.createdAt);
     let alpha = ageAlpha(age);
 
-    const phase = (h0 % 1000) / 159;
-    const shimmer = Math.sin(t * 0.35 + phase) * 0.04 + 1;
-    const lightness = base * shimmer;
+    // Per-thread breathing — the heart of "alive at idle".
+    const breathT = (now / sub.period) * Math.PI * 2 + sub.breathPhase;
+    const breathAmp = BREATH_AMP_BASE + sub.energy * BREATH_AMP_ENERGY;
+    const breathMult = 1 + Math.sin(breathT) * breathAmp;
+    // Ancient threads breathe more gently (blend with age).
+    const ageScale = clamp(ageAlpha(age) * 1.2, 0.4, 1.2);
+    const lightness = base * (1 + (breathMult - 1) * ageScale);
 
-    // Failed postmortems → desaturated red
+    // Failed → desaturated red; dismissed → faded.
     const pm = state.postmortems?.[w.id];
     const failed = pm && pm.outcome === "failed";
     const dismissed = w.dismissed;
-
     let drawH = hue, drawS = sat, drawL = lightness;
     if (failed) {
       drawH = 8;
@@ -325,44 +529,54 @@ function drawTapestry(L, now) {
     }
     if (dismissed) {
       drawS = 8;
-      alpha *= 0.5;
+      alpha *= 0.55;
     }
 
-    // thread with soft edge taper via segmented alpha
+    // Thread with soft edge taper (gradient keeps ends feathery)
     const grad = ctx.createLinearGradient(left, 0, right, 0);
     grad.addColorStop(0, hsl(drawH, drawS, drawL, 0));
     grad.addColorStop(0.06, hsl(drawH, drawS, drawL, alpha));
     grad.addColorStop(0.94, hsl(drawH, drawS, drawL, alpha));
     grad.addColorStop(1, hsl(drawH, drawS, drawL, 0));
     ctx.strokeStyle = grad;
-    ctx.lineWidth = THREAD_HEIGHT;
-
-    // slight alternating offset for weave texture
-    const off = i % 2 === 0 ? 0 : 1.2;
+    ctx.lineWidth = sub.thickness;
     ctx.beginPath();
-    ctx.moveTo(left + off, y);
-    ctx.lineTo(right - (1 - off), y);
+    ctx.moveTo(left, y);
+    ctx.lineTo(right, y);
     ctx.stroke();
 
-    // recency bloom: additive glow on very fresh threads
-    const gl = freshGlow(age);
-    if (gl > 0 && !dismissed) {
+    // Weave texture — tiny warp crossings at hash-stable x-positions.
+    // Skips the outer 4% where edge fade is heavy.
+    if (sub.crossings > 0 && !dismissed) {
+      ctx.fillStyle = hsl(drawH, drawS + 5, drawL - 18, alpha * 0.42);
+      const tickW = 0.9;
+      const tickH = sub.thickness + 1.1;
+      for (let c = 0; c < sub.crossings; c++) {
+        const u = 0.05 + sub.weaveSeeds[c] * 0.9;
+        const tx = left + (right - left) * u;
+        ctx.fillRect(tx - tickW / 2, y - tickH / 2, tickW, tickH);
+      }
+    }
+
+    // Fresh-heat glow — extra bloom on very recent threads (hours-old).
+    if (age < 0.5 && !dismissed) {
+      const heat = age < 0.04 ? 0.42 : age < 0.2 ? 0.26 : 0.12;
       const bloom = ctx.createLinearGradient(left, 0, right, 0);
       bloom.addColorStop(0, `hsla(${drawH}, ${drawS + 15}%, ${Math.min(85, drawL + 22)}%, 0)`);
       bloom.addColorStop(
         0.5,
-        `hsla(${drawH}, ${drawS + 15}%, ${Math.min(85, drawL + 22)}%, ${gl})`,
+        `hsla(${drawH}, ${drawS + 15}%, ${Math.min(85, drawL + 22)}%, ${heat})`,
       );
       bloom.addColorStop(1, `hsla(${drawH}, ${drawS + 15}%, ${Math.min(85, drawL + 22)}%, 0)`);
       ctx.strokeStyle = bloom;
-      ctx.lineWidth = THREAD_HEIGHT + 2;
+      ctx.lineWidth = sub.thickness + 2.4;
       ctx.beginPath();
-      ctx.moveTo(left + off, y);
-      ctx.lineTo(right - (1 - off), y);
+      ctx.moveTo(left, y);
+      ctx.lineTo(right, y);
       ctx.stroke();
     }
 
-    // fray at the end for failed wishes
+    // Failed threads get a small fray at the right end.
     if (failed) {
       ctx.strokeStyle = hsl(10, 28, 45, alpha * 0.9);
       ctx.lineWidth = 1;
@@ -376,25 +590,16 @@ function drawTapestry(L, now) {
     }
   }
 
-  // Empty warp continuation below the last thread — "more to come"
-  const warpsLastY = L.tapestryY + threads.length * THREAD_PITCH;
-  const warpEnd = L.tapestryY + L.tapestryH - 8;
-  if (warpEnd > warpsLastY + 10) {
-    const n = Math.max(12, Math.floor(width / 48));
-    for (let i = 1; i < n; i++) {
-      const x = left + (width * i) / n;
-      const alpha = 0.10 - (i % 3) * 0.02;
-      ctx.strokeStyle = `hsla(30, 20%, 52%, ${Math.max(0.04, alpha)})`;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x, warpsLastY + 4);
-      ctx.lineTo(x, warpEnd);
-      ctx.stroke();
-    }
+  // Memory pulses — render on their target threads (if visible).
+  for (const pulse of memoryPulses) {
+    const idx = indexById.get(pulse.wishId);
+    if (idx === undefined) continue;
+    drawMemoryPulse(L, now, pulse, idx);
   }
   ctx.restore();
 }
 
+// ---- Arrival moments ----
 function drawArrivals(L, now) {
   for (let i = arrivals.length - 1; i >= 0; i--) {
     const a = arrivals[i];
@@ -404,13 +609,11 @@ function drawArrivals(L, now) {
       continue;
     }
     const p = dt / ARRIVAL_DURATION;
-    // Find the wish's current y (it's at sortedDone index 0 — freshly added)
     const idx = sortedDone.findIndex((w) => w.id === a.wishId);
     if (idx < 0) continue;
     const y = L.tapestryY + idx * THREAD_PITCH;
     const cx = (L.tapestryLeft + L.tapestryRight) / 2;
 
-    // Warm bloom
     const radius = 12 + p * 180;
     const bloomAlpha = (1 - p) * 0.45;
     const grd = ctx.createRadialGradient(cx, y, 0, cx, y, radius);
@@ -419,7 +622,6 @@ function drawArrivals(L, now) {
     ctx.fillStyle = grd;
     ctx.fillRect(cx - radius, y - radius, radius * 2, radius * 2);
 
-    // Sparkles
     const seed = hash(a.wishId);
     for (let s = 0; s < SPARKLE_COUNT; s++) {
       const ph = (seed + s * 71) % 360;
@@ -475,9 +677,7 @@ let microIdx = 0;
 let microTimer = null;
 
 function updateMicroSummary() {
-  const recent = sortedDone
-    .filter((w) => ageDays(w.statusSince) < 3)
-    .slice(0, 8);
+  const recent = sortedDone.filter((w) => ageDays(w.statusSince) < 3).slice(0, 8);
   microItems = recent.map((w) => friendlyLine(w));
   microIdx = 0;
   renderMicro();
@@ -558,10 +758,13 @@ function truncate(s, n) {
 }
 
 function escapeHtml(s) {
-  return s.replace(
-    /[&<>"']/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]),
-  );
+  return s.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
 }
 
 // ---- Hover/click (tooltip + drawer) ----
@@ -607,7 +810,6 @@ document.addEventListener("keydown", (e) => {
 function hitTest(mx, my) {
   if (!state) return null;
   const L = layout();
-  // Tapestry hit
   if (
     my >= L.tapestryY && my <= L.tapestryY + L.tapestryH &&
     mx >= L.tapestryLeft && mx <= L.tapestryRight
@@ -617,7 +819,6 @@ function hitTest(mx, my) {
       return { type: "wish", wish: sortedDone[idx] };
     }
   }
-  // Machinery hit — active shuttles
   if (my >= L.machineryY && my <= L.machineryY + L.machineryH) {
     const warpLeft = L.tapestryLeft;
     const warpRight = L.tapestryRight - 80;
