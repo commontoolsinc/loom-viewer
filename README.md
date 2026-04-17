@@ -28,6 +28,22 @@ across all targets, affinity cascades and arrival animations included.
 Demo mode also kicks in automatically if the SSE connection fails or no
 data arrives within 1.5s, so opening `index.html` directly works too.
 
+### Live shareable demo
+
+A self-contained bundle is hosted as an unlisted secret gist and rendered
+via htmlpreview — share this link with anyone:
+
+> https://htmlpreview.github.io/?https://gist.githubusercontent.com/jkomoros/4b1b8ac76f59009c30d7318e1187a113/raw/loom-viewer-demo.html
+
+To rebuild and update the bundle:
+
+```sh
+deno task bundle
+gh gist edit 4b1b8ac76f59009c30d7318e1187a113 dist/loom-viewer-demo.html
+```
+
+See [DEPLOYMENTS.md](./DEPLOYMENTS.md) for the full deployment record.
+
 ## Configure
 
 All optional:
