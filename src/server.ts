@@ -102,6 +102,8 @@ const handler = async (req: Request): Promise<Response> => {
       return serveStatic("client.js", "text/javascript; charset=utf-8");
     case "/whisper.js":
       return serveStatic("whisper.js", "text/javascript; charset=utf-8");
+    case "/affinity.js":
+      return serveStatic("affinity.js", "text/javascript; charset=utf-8");
     case "/events":
       return sseResponse(watcher.getState());
     case "/state.json":

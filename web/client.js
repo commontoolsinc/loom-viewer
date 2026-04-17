@@ -2,6 +2,10 @@
 // Tapestry is the hero: glowing with everything taken care of. Machinery is
 // supporting cast. Every moving pixel is backed by real work — per-thread
 // breathing, thickness, and weave all derive from wish substance.
+// Threads have affinity to each other (shared agent/tag/keyword/target); a
+// glimmer on one calls answering glimmers from its neighbors.
+
+import { buildAffinity } from "/affinity.js";
 
 const TARGET_COLORS = {
   capture: [40, 45, 64], // warm yellow [hue, sat, lightness]
@@ -20,19 +24,46 @@ const FELL_HEIGHT = 10; // heated band where the cloth is being woven
 const ARRIVAL_DURATION = 1600;
 const SPARKLE_COUNT = 5;
 
-// Per-thread breathing. Amplitude scales with wish energy; hash-seeded
-// clock means every thread has its own rhythm. Never synchronized.
-const BREATH_PERIOD_MIN = 6000; // ms
+// Per-thread breathing — two-frequency shimmer so every thread feels
+// restless even when static. Slow base (wish-seeded period) + fast
+// sparkle layer. Amplitude scales with wish energy; hash-seeded clock
+// means every thread has its own rhythm. Never synchronized.
+const BREATH_PERIOD_MIN = 6000; // ms, slow base
 const BREATH_PERIOD_MAX = 18000;
-const BREATH_AMP_BASE = 0.04;
+const BREATH_AMP_BASE = 0.045;
 const BREATH_AMP_ENERGY = 0.12;
+const SHIMMER_FAST_PERIOD_MIN = 800; // fast sparkle layer (the 16ths)
+const SHIMMER_FAST_PERIOD_MAX = 1600;
+const SHIMMER_FAST_AMP_RATIO = 1.1; // fast layer slightly larger than slow — perpetual-motion feel
 
-// Memory pulses: every 4-9s, one old heavy thread gets a shuttle re-pass —
-// a bright segment travelling left-to-right as if the loom is remembering.
-const PULSE_INTERVAL_MIN = 4000;
-const PULSE_INTERVAL_MAX = 9000;
+// Glimmers: small localized flashes on a thread. Every 1.5-3s one fires
+// on an energy-weighted random thread and cascades into echo-glimmers on
+// its affinity neighbors — like related work "answering" each other.
+// Perpetuum Mobile tuning: constant steady-state motion, never eventful.
+// Density stays roughly flat, individual events are small and quick,
+// cascades blend into the texture rather than standing out as events.
+const GLIMMER_SPAWN_INTERVAL_MIN = 80;
+const GLIMMER_SPAWN_INTERVAL_MAX = 220;
+const GLIMMER_DURATION = 780;
+const GLIMMER_MAX_POOL = 260;
+const GLIMMER_RADIUS_MIN = 6;
+const GLIMMER_RADIUS_MAX = 14;
+const ECHO_DELAY_MIN = 260;
+const ECHO_DELAY_MAX = 820;
+const ECHO_COUNT_MIN = 2;
+const ECHO_COUNT_MAX = 5;
+const ECHO_DECAY = 0.78; // brightness multiplier per hop
+const SECOND_ORDER_P = 0.55; // probability an echo spawns its own echo
+const THIRD_ORDER_P = 0.30; // and a chance for a third ring
+
+// Memory pulses: disabled for Perpetuum Mobile. Big traveling sweeps
+// broke the steady-state calm. Glimmer cascades now carry the entire
+// "the loom is alive and remembering" load. Constants retained in case
+// we ever want a very-sparse ceremonial pulse back.
+const PULSE_INTERVAL_MIN = 999_999_999;
+const PULSE_INTERVAL_MAX = 999_999_999;
 const PULSE_DURATION = 2400;
-const PULSE_MAX_CONCURRENT = 2;
+const PULSE_MAX_CONCURRENT = 0;
 
 // Token motes: rare upward particles rising off heavy threads.
 const MOTE_POOL_MAX = 36;
@@ -49,12 +80,19 @@ let sortedDone = [];
 let activeRoles = [];
 let roleIndex = new Map();
 let substanceCache = new Map(); // wishId -> { thickness, energy, crossings, weaveSeeds, period }
+let affinity = new Map(); // wishId -> [neighborId, ...]
 
 // ---- Animation state ----
 const arrivals = []; // { wishId, t0, color }
 const memoryPulses = []; // { wishId, t0 }
 const tokenMotes = []; // { x, y, vy, life, born, hue, sat }
+// Glimmers: small localized flashes on specific threads, spawned as a
+// cascade from a seed + echoes on affinity neighbors.
+const glimmers = []; // { wishId, x01, t0, radius, intensity, hop }
+const pendingEchoes = []; // { wishId, x01, fireAt, intensity, hop }
 let nextPulseAt = performance.now() + randRange(PULSE_INTERVAL_MIN, PULSE_INTERVAL_MAX);
+let nextGlimmerAt = performance.now() +
+  randRange(GLIMMER_SPAWN_INTERVAL_MIN, GLIMMER_SPAWN_INTERVAL_MAX);
 
 // ---- Canvas ----
 const canvas = document.getElementById("loom");
@@ -122,6 +160,9 @@ function deriveSorted() {
     nextCache.set(w.id, computeSubstance(w, state.postmortems?.[w.id]));
   }
   substanceCache = nextCache;
+
+  // Precompute affinity graph. Only over done wishes (the visible set).
+  affinity = buildAffinity(sortedDone, state.postmortems ?? {});
 }
 
 function detectArrivals() {
@@ -177,8 +218,22 @@ function computeSubstance(w, pm) {
   const period = BREATH_PERIOD_MIN +
     (h0 % 1000) / 1000 * (BREATH_PERIOD_MAX - BREATH_PERIOD_MIN);
   const breathPhase = ((h0 >> 10) % 1000) / 1000 * Math.PI * 2;
+  // Fast shimmer layer — restless sparkle on top of slow breath.
+  const shimmerPeriod = SHIMMER_FAST_PERIOD_MIN +
+    ((h0 >> 3) % 1000) / 1000 * (SHIMMER_FAST_PERIOD_MAX - SHIMMER_FAST_PERIOD_MIN);
+  const shimmerPhase = ((h0 >> 20) % 1000) / 1000 * Math.PI * 2;
 
-  return { thickness, energy, crossings, weaveSeeds, period, breathPhase, h0 };
+  return {
+    thickness,
+    energy,
+    crossings,
+    weaveSeeds,
+    period,
+    breathPhase,
+    shimmerPeriod,
+    shimmerPhase,
+    h0,
+  };
 }
 
 // ---- Color / math helpers ----
@@ -242,11 +297,13 @@ function draw(now) {
   const L = layout();
 
   updateMemoryPulses(now);
+  updateGlimmers(now);
   updateTokenMotes(now, dt, L);
 
   drawMachinery(L, now);
   drawFellBand(L, now);
   drawTapestry(L, now);
+  drawGlimmers(L, now);
   drawTokenMotes(L);
   drawArrivals(L, now);
 
@@ -353,6 +410,141 @@ function drawFellBand(L, now) {
     ctx.beginPath();
     ctx.arc(x, ey, 1.2, 0, Math.PI * 2);
     ctx.fill();
+  }
+}
+
+// ---- Glimmers: localized flashes + cascading echoes across affinity ----
+function updateGlimmers(now) {
+  // Retire expired
+  for (let i = glimmers.length - 1; i >= 0; i--) {
+    if (now - glimmers[i].t0 > GLIMMER_DURATION) glimmers.splice(i, 1);
+  }
+  // Fire due pending echoes
+  for (let i = pendingEchoes.length - 1; i >= 0; i--) {
+    const e = pendingEchoes[i];
+    if (now >= e.fireAt) {
+      pendingEchoes.splice(i, 1);
+      fireGlimmer(e.wishId, e.x01, now, e.intensity, e.hop);
+    }
+  }
+  // Spawn a new seed glimmer
+  if (now >= nextGlimmerAt && sortedDone.length > 0 && glimmers.length < GLIMMER_MAX_POOL) {
+    spawnSeedGlimmer(now);
+    nextGlimmerAt = now + randRange(GLIMMER_SPAWN_INTERVAL_MIN, GLIMMER_SPAWN_INTERVAL_MAX);
+  }
+}
+
+function spawnSeedGlimmer(now) {
+  // Nearly-flat weighting — every thread has a chance. Slight bias to
+  // energy so heavy threads glimmer somewhat more, but old stub threads
+  // still speak. Perpetuum Mobile: the whole surface participates.
+  let totalW = 0;
+  const weights = sortedDone.map((w) => {
+    const sub = substanceCache.get(w.id);
+    if (!sub) return 0;
+    const weight = 0.55 + sub.energy * 0.9; // 0.55 .. 1.45
+    totalW += weight;
+    return weight;
+  });
+  if (totalW <= 0) return;
+  let r = Math.random() * totalW;
+  let picked = 0;
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) {
+      picked = i;
+      break;
+    }
+  }
+  const w = sortedDone[picked];
+  const x01 = 0.08 + Math.random() * 0.84;
+  fireGlimmer(w.id, x01, now, 1.0, 0);
+}
+
+function fireGlimmer(wishId, x01, now, intensity, hop) {
+  if (glimmers.length >= GLIMMER_MAX_POOL) glimmers.shift();
+  const sub = substanceCache.get(wishId);
+  const energy = sub?.energy ?? 0.3;
+  const radius = GLIMMER_RADIUS_MIN +
+    (GLIMMER_RADIUS_MAX - GLIMMER_RADIUS_MIN) * clamp(energy * intensity, 0.1, 1);
+  glimmers.push({ wishId, x01, t0: now, radius, intensity, hop });
+
+  // Schedule echoes on affinity neighbors — bounded by hop count.
+  if (hop >= 2) return;
+  const neighbors = affinity.get(wishId) ?? [];
+  if (neighbors.length === 0) return;
+  const echoCount = Math.floor(
+    ECHO_COUNT_MIN +
+      Math.random() * (Math.min(neighbors.length, ECHO_COUNT_MAX) - ECHO_COUNT_MIN + 1),
+  );
+  for (let i = 0; i < echoCount && i < neighbors.length; i++) {
+    // Echo at a nearby x (not identical) suggesting spatial relation.
+    const echoX = clamp(x01 + (Math.random() - 0.5) * 0.22, 0.08, 0.92);
+    pendingEchoes.push({
+      wishId: neighbors[i],
+      x01: echoX,
+      fireAt: now + randRange(ECHO_DELAY_MIN, ECHO_DELAY_MAX),
+      intensity: intensity * ECHO_DECAY,
+      hop: hop + 1,
+    });
+  }
+  // Rare second-order cascade gets an extra chance.
+  if (hop === 0 && Math.random() < SECOND_ORDER_P) {
+    // the first echo will naturally propagate (hop <=1) — nothing extra here.
+  }
+}
+
+function drawGlimmers(L, now) {
+  if (glimmers.length === 0) return;
+  // Map wishId → thread index for visible threads.
+  const maxThreads = Math.floor(L.tapestryH / THREAD_PITCH);
+  const visibleIds = new Map();
+  for (let i = 0; i < Math.min(sortedDone.length, maxThreads); i++) {
+    visibleIds.set(sortedDone[i].id, i);
+  }
+  const left = L.tapestryLeft;
+  const right = L.tapestryRight;
+  const width = right - left;
+
+  for (const g of glimmers) {
+    const idx = visibleIds.get(g.wishId);
+    if (idx === undefined) continue;
+    const w = sortedDone[idx];
+    const [hue, sat] = colorForTarget(w.target);
+    const y = L.tapestryY + idx * THREAD_PITCH;
+    const x = left + width * g.x01;
+
+    const t = (now - g.t0) / GLIMMER_DURATION;
+    if (t < 0 || t > 1) continue;
+    // envelope: gentle rise, gentle fade — no punctuation
+    const env = t < 0.25
+      ? Math.sin((t / 0.25) * Math.PI * 0.5)
+      : Math.pow(1 - (t - 0.25) / 0.75, 1.3);
+    const a = 0.55 * g.intensity * env;
+    const r = g.radius * (0.65 + env * 0.6);
+
+    // Soft colored bloom — no hot white core. Every glimmer is the
+    // same flavor of "something gentle lit up and settled again."
+    const grd = ctx.createRadialGradient(x, y, 0, x, y, r);
+    grd.addColorStop(0, `hsla(${hue}, ${sat + 20}%, 80%, ${a})`);
+    grd.addColorStop(0.4, `hsla(${hue}, ${sat + 15}%, 74%, ${a * 0.5})`);
+    grd.addColorStop(1, `hsla(${hue}, ${sat + 10}%, 68%, 0)`);
+    ctx.fillStyle = grd;
+    ctx.fillRect(x - r, y - r, r * 2, r * 2);
+
+    // Horizontal flare along the thread — short, suggests "this thread
+    // spoke". Intentionally brief and subtle.
+    const flareW = r * 1.2;
+    const flareGrd = ctx.createLinearGradient(x - flareW, y, x + flareW, y);
+    flareGrd.addColorStop(0, `hsla(${hue}, ${sat + 15}%, 78%, 0)`);
+    flareGrd.addColorStop(0.5, `hsla(${hue}, ${sat + 20}%, 82%, ${a * 0.6})`);
+    flareGrd.addColorStop(1, `hsla(${hue}, ${sat + 15}%, 78%, 0)`);
+    ctx.strokeStyle = flareGrd;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(x - flareW, y);
+    ctx.lineTo(x + flareW, y);
+    ctx.stroke();
   }
 }
 
@@ -509,13 +701,17 @@ function drawTapestry(L, now) {
     const age = ageDays(w.statusSince ?? w.createdAt);
     let alpha = ageAlpha(age);
 
-    // Per-thread breathing — the heart of "alive at idle".
+    // Per-thread breathing — the heart of "alive at idle". Two layers:
+    // slow base breath + a faster sparkle layer. Different periods per
+    // thread, never synchronized.
     const breathT = (now / sub.period) * Math.PI * 2 + sub.breathPhase;
+    const shimT = (now / sub.shimmerPeriod) * Math.PI * 2 + sub.shimmerPhase;
     const breathAmp = BREATH_AMP_BASE + sub.energy * BREATH_AMP_ENERGY;
-    const breathMult = 1 + Math.sin(breathT) * breathAmp;
+    const shimAmp = breathAmp * SHIMMER_FAST_AMP_RATIO;
+    const osc = Math.sin(breathT) * breathAmp + Math.sin(shimT) * shimAmp;
     // Ancient threads breathe more gently (blend with age).
     const ageScale = clamp(ageAlpha(age) * 1.2, 0.4, 1.2);
-    const lightness = base * (1 + (breathMult - 1) * ageScale);
+    const lightness = base * (1 + osc * ageScale);
 
     // Failed → desaturated red; dismissed → faded.
     const pm = state.postmortems?.[w.id];
