@@ -20,6 +20,14 @@ deno task viewer
 
 Opens on `http://localhost:7733`.
 
+## Demo mode
+
+Don't have a Loom fabric to point this at? Open `http://localhost:7733/?demo`
+to see the viewer running on a synthetic fabric — ~80 plausible wishes
+across all targets, affinity cascades and arrival animations included.
+Demo mode also kicks in automatically if the SSE connection fails or no
+data arrives within 1.5s, so opening `index.html` directly works too.
+
 ## Configure
 
 All optional:

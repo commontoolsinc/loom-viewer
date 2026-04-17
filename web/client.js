@@ -6,6 +6,7 @@
 // glimmer on one calls answering glimmers from its neighbors.
 
 import { buildAffinity } from "/affinity.js";
+import { buildDemoState } from "/demo-data.js";
 
 const TARGET_COLORS = {
   capture: [40, 45, 64], // warm yellow [hue, sat, lightness]
@@ -28,13 +29,13 @@ const SPARKLE_COUNT = 5;
 // restless even when static. Slow base (wish-seeded period) + fast
 // sparkle layer. Amplitude scales with wish energy; hash-seeded clock
 // means every thread has its own rhythm. Never synchronized.
-const BREATH_PERIOD_MIN = 6000; // ms, slow base
-const BREATH_PERIOD_MAX = 18000;
-const BREATH_AMP_BASE = 0.045;
-const BREATH_AMP_ENERGY = 0.12;
-const SHIMMER_FAST_PERIOD_MIN = 800; // fast sparkle layer (the 16ths)
-const SHIMMER_FAST_PERIOD_MAX = 1600;
-const SHIMMER_FAST_AMP_RATIO = 1.1; // fast layer slightly larger than slow — perpetual-motion feel
+const BREATH_PERIOD_MIN = 8000; // ms, slow base
+const BREATH_PERIOD_MAX = 22000;
+const BREATH_AMP_BASE = 0.034;
+const BREATH_AMP_ENERGY = 0.09;
+const SHIMMER_FAST_PERIOD_MIN = 1400; // slower fast layer — less restless
+const SHIMMER_FAST_PERIOD_MAX = 2800;
+const SHIMMER_FAST_AMP_RATIO = 0.8;
 
 // Glimmers: small localized flashes on a thread. Every 1.5-3s one fires
 // on an energy-weighted random thread and cascades into echo-glimmers on
@@ -42,19 +43,19 @@ const SHIMMER_FAST_AMP_RATIO = 1.1; // fast layer slightly larger than slow — 
 // Perpetuum Mobile tuning: constant steady-state motion, never eventful.
 // Density stays roughly flat, individual events are small and quick,
 // cascades blend into the texture rather than standing out as events.
-const GLIMMER_SPAWN_INTERVAL_MIN = 80;
-const GLIMMER_SPAWN_INTERVAL_MAX = 220;
-const GLIMMER_DURATION = 780;
-const GLIMMER_MAX_POOL = 260;
-const GLIMMER_RADIUS_MIN = 6;
-const GLIMMER_RADIUS_MAX = 14;
-const ECHO_DELAY_MIN = 260;
-const ECHO_DELAY_MAX = 820;
-const ECHO_COUNT_MIN = 2;
-const ECHO_COUNT_MAX = 5;
-const ECHO_DECAY = 0.78; // brightness multiplier per hop
-const SECOND_ORDER_P = 0.55; // probability an echo spawns its own echo
-const THIRD_ORDER_P = 0.30; // and a chance for a third ring
+const GLIMMER_SPAWN_INTERVAL_MIN = 110;
+const GLIMMER_SPAWN_INTERVAL_MAX = 290;
+const GLIMMER_DURATION = 980; // a touch longer so each event is gentler
+const GLIMMER_MAX_POOL = 220;
+const GLIMMER_RADIUS_MIN = 5;
+const GLIMMER_RADIUS_MAX = 12;
+const ECHO_DELAY_MIN = 320;
+const ECHO_DELAY_MAX = 950;
+const ECHO_COUNT_MIN = 1;
+const ECHO_COUNT_MAX = 4;
+const ECHO_DECAY = 0.7; // brightness multiplier per hop
+const SECOND_ORDER_P = 0.42;
+const THIRD_ORDER_P = 0.18;
 
 // Memory pulses: disabled for Perpetuum Mobile. Big traveling sweeps
 // broke the steady-state calm. Glimmer cascades now carry the entire
@@ -112,16 +113,60 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-// ---- SSE ----
+// ---- SSE / demo mode ----
+// Demo mode: ?demo in URL forces it; otherwise fall back to demo if SSE
+// hasn't delivered a snapshot within 1.5s (no daemon, file:// open, etc).
+let demoMode = false;
+let demoTimer = null;
+
+function isDemoForced() {
+  try {
+    const params = new URLSearchParams(globalThis.location?.search ?? "");
+    return params.has("demo");
+  } catch {
+    return false;
+  }
+}
+
+function startDemo() {
+  if (demoMode) return;
+  demoMode = true;
+  applySnapshot(buildDemoState());
+  // Periodically nudge state so the "1 today" counters and recency feel current
+  setInterval(() => applySnapshot(buildDemoState()), 60_000);
+}
+
 function connectSSE() {
-  const es = new EventSource("/events");
+  if (isDemoForced()) {
+    startDemo();
+    return;
+  }
+
+  // Fall back to demo if SSE doesn't deliver within 1.5s
+  demoTimer = setTimeout(() => {
+    if (!state) startDemo();
+  }, 1500);
+
+  let es;
+  try {
+    es = new EventSource("/events");
+  } catch {
+    startDemo();
+    return;
+  }
   es.addEventListener("open", () => {
     connected = true;
   });
   es.addEventListener("error", () => {
     connected = false;
+    if (!state) startDemo();
   });
   es.addEventListener("message", (e) => {
+    if (demoMode) return; // ignore real data once demo is active
+    if (demoTimer) {
+      clearTimeout(demoTimer);
+      demoTimer = null;
+    }
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === "snapshot") applySnapshot(msg.state);
@@ -520,8 +565,8 @@ function drawGlimmers(L, now) {
     const env = t < 0.25
       ? Math.sin((t / 0.25) * Math.PI * 0.5)
       : Math.pow(1 - (t - 0.25) / 0.75, 1.3);
-    const a = 0.55 * g.intensity * env;
-    const r = g.radius * (0.65 + env * 0.6);
+    const a = 0.42 * g.intensity * env;
+    const r = g.radius * (0.65 + env * 0.55);
 
     // Soft colored bloom — no hot white core. Every glimmer is the
     // same flavor of "something gentle lit up and settled again."
@@ -843,6 +888,12 @@ function updateHUD() {
 
   const dot = document.getElementById("health-dot");
   const label = document.getElementById("health-label");
+  if (demoMode) {
+    dot.classList.remove("alive");
+    dot.style.background = "#c896f0";
+    label.textContent = "demo · synthetic fabric";
+    return;
+  }
   const h = state.daemon;
   if (h && h.alive) {
     dot.classList.add("alive");
