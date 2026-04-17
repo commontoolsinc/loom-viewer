@@ -123,6 +123,7 @@ let demoTimer = null;
 
 function isDemoForced() {
   try {
+    if (typeof window !== "undefined" && window.__LOOM_FORCE_DEMO__) return true;
     const params = new URLSearchParams(globalThis.location?.search ?? "");
     return params.has("demo");
   } catch {
@@ -369,7 +370,7 @@ function drawMachinery(L, now) {
   ctx.save();
   for (let i = 0; i < n; i++) {
     const x = warpLeft + (warpRight - warpLeft) * ((i + 0.5) / n);
-    const breathe = 0.30 + Math.sin(t * 0.2 + i) * 0.06;
+    const breathe = 0.30 + Math.sin(t * 0.8 + i) * 0.06;
     // Warps descend from top of strip THROUGH the fell band INTO the cloth.
     const grad = ctx.createLinearGradient(0, L.machineryY, 0, L.tapestryY + 16);
     grad.addColorStop(0, `hsla(30, 22%, 55%, ${breathe})`);
@@ -390,7 +391,7 @@ function drawMachinery(L, now) {
     const y = L.machineryY + 14 + i * 7;
     ctx.strokeStyle = `hsla(40, 50%, 70%, ${0.35 + (i === 0 ? 0.2 : 0)})`;
     ctx.lineWidth = 1.2;
-    const wiggle = Math.sin(t * 0.15 + i) * 3;
+    const wiggle = Math.sin(t * 0.6 + i) * 3;
     ctx.beginPath();
     ctx.moveTo(hankX + wiggle, y);
     ctx.lineTo(hankX + 30, y);
@@ -403,7 +404,7 @@ function drawMachinery(L, now) {
     if (idx === undefined) return;
     const x = warpLeft + (warpRight - warpLeft) * ((idx + 0.5) / n);
     const yMid = L.machineryY + L.machineryH * 0.55;
-    const yOsc = Math.sin(t * 0.35 + idx) * (L.machineryH * 0.25);
+    const yOsc = Math.sin(t * 1.4 + idx) * (L.machineryH * 0.25);
     const cy = yMid + yOsc;
     const grd = ctx.createRadialGradient(x, cy, 0, x, cy, 14);
     grd.addColorStop(0, "hsla(40, 80%, 72%, 0.55)");
@@ -423,7 +424,7 @@ function drawMachinery(L, now) {
   beacons.forEach((w, i) => {
     const x = warpLeft + 30 + (i * 28);
     const cy = machineryBottom - 14;
-    const pulse = 0.6 + Math.sin(t * 0.75 + i) * 0.35;
+    const pulse = 0.6 + Math.sin(t * 3 + i) * 0.35;
     ctx.fillStyle = `hsla(35, 90%, 60%, ${pulse})`;
     ctx.beginPath();
     ctx.arc(x, cy, 4, 0, Math.PI * 2);
@@ -436,8 +437,8 @@ function drawMachinery(L, now) {
 function drawFellBand(L, now) {
   const t = now / 1000;
   const y = L.fellY;
-  // 4x slower flicker — same warmth, less twitch
-  const flicker = 0.85 + Math.sin(t * 0.42) * 0.06 + Math.sin(t * 0.82) * 0.04;
+  // Fell band represents "actively being woven RIGHT NOW" — fast flicker.
+  const flicker = 0.85 + Math.sin(t * 1.7) * 0.06 + Math.sin(t * 3.3) * 0.04;
   const bandAlpha = 0.22 * flicker;
 
   // Heat gradient: vertical, hot at bottom of the band (where cloth meets loom)
@@ -448,12 +449,12 @@ function drawFellBand(L, now) {
   ctx.fillStyle = grad;
   ctx.fillRect(L.tapestryLeft - 12, y, (L.tapestryRight - L.tapestryLeft) + 24, FELL_HEIGHT + 4);
 
-  // Embers — small bright points drifting along the fell line (4x slower)
+  // Embers — small bright points drifting along the fell line (live, fast)
   for (let i = 0; i < 6; i++) {
     const x = L.tapestryLeft +
-      (L.tapestryRight - L.tapestryLeft) * (((t * 0.0125) + i * 0.17) % 1);
-    const ey = y + FELL_HEIGHT - 2 + Math.sin(t * 0.5 + i) * 1.5;
-    const a = 0.3 + Math.sin(t * 0.6 + i * 1.3) * 0.25;
+      (L.tapestryRight - L.tapestryLeft) * (((t * 0.05) + i * 0.17) % 1);
+    const ey = y + FELL_HEIGHT - 2 + Math.sin(t * 2 + i) * 1.5;
+    const a = 0.3 + Math.sin(t * 2.4 + i * 1.3) * 0.25;
     ctx.fillStyle = `hsla(40, 85%, 78%, ${Math.max(0, a)})`;
     ctx.beginPath();
     ctx.arc(x, ey, 1.2, 0, Math.PI * 2);
