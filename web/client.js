@@ -29,13 +29,13 @@ const SPARKLE_COUNT = 5;
 // restless even when static. Slow base (wish-seeded period) + fast
 // sparkle layer. Amplitude scales with wish energy; hash-seeded clock
 // means every thread has its own rhythm. Never synchronized.
-const BREATH_PERIOD_MIN = 8000; // ms, slow base
-const BREATH_PERIOD_MAX = 22000;
-const BREATH_AMP_BASE = 0.034;
-const BREATH_AMP_ENERGY = 0.09;
-const SHIMMER_FAST_PERIOD_MIN = 1400; // slower fast layer — less restless
-const SHIMMER_FAST_PERIOD_MAX = 2800;
-const SHIMMER_FAST_AMP_RATIO = 0.8;
+const BREATH_PERIOD_MIN = 24000; // 4x slower clock
+const BREATH_PERIOD_MAX = 72000;
+const BREATH_AMP_BASE = 0.045;
+const BREATH_AMP_ENERGY = 0.12;
+const SHIMMER_FAST_PERIOD_MIN = 3200;
+const SHIMMER_FAST_PERIOD_MAX = 6400;
+const SHIMMER_FAST_AMP_RATIO = 1.1;
 
 // Glimmers: small localized flashes on a thread. Every 1.5-3s one fires
 // on an energy-weighted random thread and cascades into echo-glimmers on
@@ -43,19 +43,21 @@ const SHIMMER_FAST_AMP_RATIO = 0.8;
 // Perpetuum Mobile tuning: constant steady-state motion, never eventful.
 // Density stays roughly flat, individual events are small and quick,
 // cascades blend into the texture rather than standing out as events.
-const GLIMMER_SPAWN_INTERVAL_MIN = 110;
-const GLIMMER_SPAWN_INTERVAL_MAX = 290;
-const GLIMMER_DURATION = 980; // a touch longer so each event is gentler
-const GLIMMER_MAX_POOL = 220;
-const GLIMMER_RADIUS_MIN = 5;
-const GLIMMER_RADIUS_MAX = 12;
-const ECHO_DELAY_MIN = 320;
-const ECHO_DELAY_MAX = 950;
-const ECHO_COUNT_MIN = 1;
-const ECHO_COUNT_MAX = 4;
-const ECHO_DECAY = 0.7; // brightness multiplier per hop
-const SECOND_ORDER_P = 0.42;
-const THIRD_ORDER_P = 0.18;
+// All clocks slowed 4x. Same density (since spawn interval grows with
+// duration, peak count is roughly preserved), each event much longer.
+const GLIMMER_SPAWN_INTERVAL_MIN = 320;
+const GLIMMER_SPAWN_INTERVAL_MAX = 880;
+const GLIMMER_DURATION = 3120;
+const GLIMMER_MAX_POOL = 260;
+const GLIMMER_RADIUS_MIN = 6;
+const GLIMMER_RADIUS_MAX = 14;
+const ECHO_DELAY_MIN = 1040;
+const ECHO_DELAY_MAX = 3280;
+const ECHO_COUNT_MIN = 2;
+const ECHO_COUNT_MAX = 5;
+const ECHO_DECAY = 0.78; // brightness multiplier per hop
+const SECOND_ORDER_P = 0.55;
+const THIRD_ORDER_P = 0.30;
 
 // Memory pulses: disabled for Perpetuum Mobile. Big traveling sweeps
 // broke the steady-state calm. Glimmer cascades now carry the entire
@@ -367,7 +369,7 @@ function drawMachinery(L, now) {
   ctx.save();
   for (let i = 0; i < n; i++) {
     const x = warpLeft + (warpRight - warpLeft) * ((i + 0.5) / n);
-    const breathe = 0.30 + Math.sin(t * 0.8 + i) * 0.06;
+    const breathe = 0.30 + Math.sin(t * 0.2 + i) * 0.06;
     // Warps descend from top of strip THROUGH the fell band INTO the cloth.
     const grad = ctx.createLinearGradient(0, L.machineryY, 0, L.tapestryY + 16);
     grad.addColorStop(0, `hsla(30, 22%, 55%, ${breathe})`);
@@ -388,7 +390,7 @@ function drawMachinery(L, now) {
     const y = L.machineryY + 14 + i * 7;
     ctx.strokeStyle = `hsla(40, 50%, 70%, ${0.35 + (i === 0 ? 0.2 : 0)})`;
     ctx.lineWidth = 1.2;
-    const wiggle = Math.sin(t * 0.6 + i) * 3;
+    const wiggle = Math.sin(t * 0.15 + i) * 3;
     ctx.beginPath();
     ctx.moveTo(hankX + wiggle, y);
     ctx.lineTo(hankX + 30, y);
@@ -401,7 +403,7 @@ function drawMachinery(L, now) {
     if (idx === undefined) return;
     const x = warpLeft + (warpRight - warpLeft) * ((idx + 0.5) / n);
     const yMid = L.machineryY + L.machineryH * 0.55;
-    const yOsc = Math.sin(t * 1.4 + idx) * (L.machineryH * 0.25);
+    const yOsc = Math.sin(t * 0.35 + idx) * (L.machineryH * 0.25);
     const cy = yMid + yOsc;
     const grd = ctx.createRadialGradient(x, cy, 0, x, cy, 14);
     grd.addColorStop(0, "hsla(40, 80%, 72%, 0.55)");
@@ -421,7 +423,7 @@ function drawMachinery(L, now) {
   beacons.forEach((w, i) => {
     const x = warpLeft + 30 + (i * 28);
     const cy = machineryBottom - 14;
-    const pulse = 0.6 + Math.sin(t * 3 + i) * 0.35;
+    const pulse = 0.6 + Math.sin(t * 0.75 + i) * 0.35;
     ctx.fillStyle = `hsla(35, 90%, 60%, ${pulse})`;
     ctx.beginPath();
     ctx.arc(x, cy, 4, 0, Math.PI * 2);
@@ -434,7 +436,8 @@ function drawMachinery(L, now) {
 function drawFellBand(L, now) {
   const t = now / 1000;
   const y = L.fellY;
-  const flicker = 0.85 + Math.sin(t * 1.7) * 0.06 + Math.sin(t * 3.3) * 0.04;
+  // 4x slower flicker — same warmth, less twitch
+  const flicker = 0.85 + Math.sin(t * 0.42) * 0.06 + Math.sin(t * 0.82) * 0.04;
   const bandAlpha = 0.22 * flicker;
 
   // Heat gradient: vertical, hot at bottom of the band (where cloth meets loom)
@@ -445,12 +448,12 @@ function drawFellBand(L, now) {
   ctx.fillStyle = grad;
   ctx.fillRect(L.tapestryLeft - 12, y, (L.tapestryRight - L.tapestryLeft) + 24, FELL_HEIGHT + 4);
 
-  // Embers — small bright points drifting along the fell line
+  // Embers — small bright points drifting along the fell line (4x slower)
   for (let i = 0; i < 6; i++) {
     const x = L.tapestryLeft +
-      (L.tapestryRight - L.tapestryLeft) * (((t * 0.05) + i * 0.17) % 1);
-    const ey = y + FELL_HEIGHT - 2 + Math.sin(t * 2 + i) * 1.5;
-    const a = 0.3 + Math.sin(t * 2.4 + i * 1.3) * 0.25;
+      (L.tapestryRight - L.tapestryLeft) * (((t * 0.0125) + i * 0.17) % 1);
+    const ey = y + FELL_HEIGHT - 2 + Math.sin(t * 0.5 + i) * 1.5;
+    const a = 0.3 + Math.sin(t * 0.6 + i * 1.3) * 0.25;
     ctx.fillStyle = `hsla(40, 85%, 78%, ${Math.max(0, a)})`;
     ctx.beginPath();
     ctx.arc(x, ey, 1.2, 0, Math.PI * 2);
@@ -565,8 +568,8 @@ function drawGlimmers(L, now) {
     const env = t < 0.25
       ? Math.sin((t / 0.25) * Math.PI * 0.5)
       : Math.pow(1 - (t - 0.25) / 0.75, 1.3);
-    const a = 0.42 * g.intensity * env;
-    const r = g.radius * (0.65 + env * 0.55);
+    const a = 0.55 * g.intensity * env;
+    const r = g.radius * (0.65 + env * 0.6);
 
     // Soft colored bloom — no hot white core. Every glimmer is the
     // same flavor of "something gentle lit up and settled again."
